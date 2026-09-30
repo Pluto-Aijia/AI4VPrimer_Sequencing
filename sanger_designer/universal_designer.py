@@ -140,6 +140,14 @@ class UniversalSangerDesigner:
         matches = 0
         p_len = len(primer_seq)
 
+        # High-performance C-speed fast path for invariant (Tier 1) non-degenerate primers
+        is_pure_dna = all(c in "ACGTacgt" for c in primer_seq)
+        if is_pure_dna:
+            for s in sequences:
+                if s[start_col:end_col] == primer_seq:
+                    matches += 1
+            return round((matches / num_seqs) * 100.0, 2)
+
         for s in sequences:
             sub = s[start_col:end_col]
             if '-' in sub or '.' in sub or len(sub) != p_len:
@@ -154,7 +162,8 @@ class UniversalSangerDesigner:
         amplicon_msa: List[str],
         direction: str = "FORWARD",
         target_subregion_start: Optional[int] = None,
-        target_subregion_end: Optional[int] = None
+        target_subregion_end: Optional[int] = None,
+        exclude_range: Optional[Tuple[int, int]] = None
     ) -> Dict:
         """
         Designs the optimal universal Sanger sequencing primer.
@@ -162,6 +171,7 @@ class UniversalSangerDesigner:
         :param direction: "FORWARD" or "REVERSE".
         :param target_subregion_start: Start index of the target subregion (e.g. variable region) relative to amplicon.
         :param target_subregion_end: End index of target subregion.
+        :param exclude_range: Optional (start, end) column range to strictly prevent forward/reverse overlap.
         :return: Dict containing selected candidate, tier level, concentration instructions, and runner-ups.
         """
         amp_len = len(amplicon_msa[0])
@@ -169,21 +179,21 @@ class UniversalSangerDesigner:
         col_freqs = get_column_frequencies(amplicon_msa)
 
         # Determine search window boundaries
-        # Skip ragged ends by default if unanchored (e.g. first 50 bp and last 50 bp often have gap artifacts)
+        # Ensure Forward and Reverse are strictly partitioned to 5' and 3' halves on short/moderate amplicons
         if direction.upper() == "FORWARD":
             if target_subregion_start is not None:
                 max_pos = max(0, target_subregion_start - self.dye_blob_buffer)
                 min_pos = max(0, max_pos - 250)
             else:
-                min_pos = 35  # skip extreme ragged ends
-                max_pos = min(amp_len - 35, 350)
-        else: # REVERSE primer: must sit DOWNSTREAM of target_subregion
+                min_pos = 0 if amp_len <= 500 else 35
+                max_pos = amp_len // 2 if amp_len <= 500 else min(amp_len // 2, 350)
+        else: # REVERSE primer: must sit DOWNSTREAM of target_subregion or at 3' terminal section
             if target_subregion_end is not None:
                 min_pos = min(amp_len, target_subregion_end + self.dye_blob_buffer)
                 max_pos = min(amp_len, min_pos + 250)
             else:
-                min_pos = max(35, amp_len - 350)
-                max_pos = max(min_pos + 1, amp_len - 35)
+                min_pos = amp_len // 2 if amp_len <= 500 else max(amp_len // 2, amp_len - 350)
+                max_pos = amp_len if amp_len <= 500 else max(min_pos + 1, amp_len - 35)
 
         # ----------------------------------------------------
         # TIER 1: STRICT INVARIANT (0 Degeneracy)
@@ -193,6 +203,12 @@ class UniversalSangerDesigner:
         for p_len in range(self.min_len, self.max_len + 1):
             for start_idx in range(min_pos, max_pos - p_len + 1):
                 end_idx = start_idx + p_len
+
+                # Enforce exclusion range (e.g. no overlap with opposing primer)
+                if exclude_range:
+                    ex_start, ex_end = exclude_range
+                    if not (end_idx <= ex_start or start_idx >= ex_end):
+                        continue
                 
                 # Build consensus oligo from top base at each column
                 consensus_chars = []
@@ -258,6 +274,12 @@ class UniversalSangerDesigner:
         for p_len in range(self.min_len, self.max_len + 1):
             for start_idx in range(min_pos, max_pos - p_len + 1):
                 end_idx = start_idx + p_len
+
+                # Enforce exclusion range in Tier 2 as well
+                if exclude_range:
+                    ex_start, ex_end = exclude_range
+                    if not (end_idx <= ex_start or start_idx >= ex_end):
+                        continue
 
                 # Scan windows and test introducing a single 2-fold degenerate base
                 for wobble_rel_pos in range(p_len):

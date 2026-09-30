@@ -117,11 +117,15 @@ class SangerAmpliconPipeline:
             target_subregion_start=amp_subregion_start,
             target_subregion_end=amp_subregion_end
         )
+        f_cand = uni_fwd.get("selected_primer")
+        f_range = (f_cand["start_col"], f_cand["end_col"]) if f_cand else None
+
         uni_rev = self.universal_designer.design_universal_primer(
             amplicon_msa,
             direction="REVERSE",
             target_subregion_start=amp_subregion_start,
-            target_subregion_end=amp_subregion_end
+            target_subregion_end=amp_subregion_end,
+            exclude_range=f_range
         )
 
         # Step 4: Strain-Specific Panel Design (Rule 3: Mixture Deconvolution)
@@ -140,9 +144,12 @@ class SangerAmpliconPipeline:
         import re
         from .insilico_pcr import iupac_to_regex
 
-        # Count total records in raw fasta
+        # Cache full fasta records in memory once for fast multi-primer validation
+        full_seqs_cache: List[str] = []
         try:
-            total_full_seqs = sum(1 for _ in SeqIO.parse(full_fasta_path, "fasta"))
+            for r in SeqIO.parse(full_fasta_path, "fasta"):
+                full_seqs_cache.append(str(r.seq).upper())
+            total_full_seqs = len(full_seqs_cache)
         except Exception:
             total_full_seqs = total_sequences
 
@@ -151,10 +158,7 @@ class SangerAmpliconPipeline:
                 return {"full_count": 0, "total_full": total_full_seqs, "full_pct": 0.0}
             target_seq = reverse_complement(primer_seq) if is_reverse else primer_seq
             pat = re.compile(iupac_to_regex(target_seq))
-            matched = 0
-            for r in SeqIO.parse(full_fasta_path, "fasta"):
-                if pat.search(str(r.seq).upper()):
-                    matched += 1
+            matched = sum(1 for s in full_seqs_cache if pat.search(s)) if full_seqs_cache else 0
             pct = round((matched / total_full_seqs) * 100.0, 2)
             return {"full_count": matched, "total_full": total_full_seqs, "full_pct": pct}
 
@@ -181,8 +185,25 @@ class SangerAmpliconPipeline:
                 p["full_dataset_count"] = v_t["full_count"]
                 p["total_full_dataset"] = v_t["total_full"]
 
+        # Check if any strain-specific panel primer has the exact same sequence as a universal primer
+        uf_p = uni_fwd.get("selected_primer") if uni_fwd else None
+        ur_p = uni_rev.get("selected_primer") if uni_rev else None
+        uf_seq = uf_p.get("sequence", "") if uf_p else ""
+        ur_seq = ur_p.get("sequence", "") if ur_p else ""
+
         # Validate Strain-Specific Lineages on Full Dataset and Subsample
         for entry in strain_panel_fwd.get("panel", []):
+            if uf_seq and entry["sequence"] == uf_seq:
+                entry["primer_name"] = "Uni-Seq-F1"
+                entry["is_universal_reuse"] = True
+                entry["action_protocol"] = f"Test in {entry['tube_id']} using Uni-Seq-F1. Covers {entry['target_cluster']} cleanly."
+            elif ur_seq and entry["sequence"] == ur_seq:
+                entry["primer_name"] = "Uni-Seq-R1"
+                entry["is_universal_reuse"] = True
+                entry["action_protocol"] = f"Test in {entry['tube_id']} using Uni-Seq-R1. Covers {entry['target_cluster']} cleanly."
+            else:
+                entry["is_universal_reuse"] = False
+
             v_s = validate_on_full(entry["sequence"], is_reverse=(entry["direction"] == "REVERSE"))
             entry["full_dataset_coverage_pct"] = v_s["full_pct"]
             entry["full_dataset_count"] = v_s["full_count"]
@@ -197,19 +218,23 @@ class SangerAmpliconPipeline:
             entry["subsample_count"] = sub_matches
             entry["subsample_freq"] = round((sub_matches / total_sequences) * 100.0, 2)
 
-        # Update all_clusters with true primer-binding counts
+        # Annotate each cluster with estimated full dataset counts and assigned primer name
         for c in strain_panel_fwd.get("all_clusters", []):
+            c["full_freq_est"] = c["freq"]
+            c["full_count_est"] = round(c["freq"] * total_full_seqs / 100)
+            assigned_tube = c.get("assigned_tube", "Uncovered")
+            c["assigned_primer_name"] = ""
             for entry in strain_panel_fwd.get("panel", []):
-                if entry["target_cluster"] == c["id"]:
-                    c["count"] = entry["subsample_count"]
-                    c["freq"] = entry["subsample_freq"]
-                    c["full_count"] = entry["full_dataset_count"]
-                    c["full_freq"] = entry["full_dataset_coverage_pct"]
+                if entry["tube_id"] == assigned_tube:
+                    c["assigned_primer_name"] = entry["primer_name"]
                     break
 
-        # Update panel total coverage
-        total_sub_cov = round(sum(entry.get("subsample_freq", entry["frequency_covered_pct"]) for entry in strain_panel_fwd.get("panel", [])), 2)
-        total_full_cov = round(sum(entry.get("full_dataset_coverage_pct", entry["frequency_covered_pct"]) for entry in strain_panel_fwd.get("panel", [])), 2)
+        # Update panel total coverage accurately (union over subsample, capped at 100%)
+        panel_covered_sub = set()
+        for entry in strain_panel_fwd.get("panel", []):
+            panel_covered_sub.update(entry.get("covered_indices", []))
+        total_sub_cov = round(min(100.0, (len(panel_covered_sub) / total_sequences) * 100.0), 2) if total_sequences else 0.0
+        total_full_cov = round(min(100.0, sum(entry.get("full_dataset_coverage_pct", 0) for entry in strain_panel_fwd.get("panel", []))), 2)
         strain_panel_fwd["total_coverage_pct"] = total_sub_cov
         strain_panel_fwd["total_full_coverage_pct"] = total_full_cov
 
@@ -316,43 +341,63 @@ class SangerAmpliconPipeline:
             ""
         ])
 
-        if is_subsampled:
+        if not uf and not ur:
             lines.extend([
-                "### Universal Primers Summary Table",
-                "| Primer ID | Role | Direction | Position (bp) | Length | Sequence (5' → 3') | Tm (°C) | GC% | Subsample Cov | Full Cov | Tier |",
-                "|---|---|---|---|---|---|---|---|---|---|---|"
+                "> [!WARNING]",
+                "> **No Universal Primer Met Threshold:** Neither forward nor reverse directions contain a universal conserved site meeting the minimum coverage requirement. Please use Mode 2 (Strain-Specific Panel) below.",
+                ""
             ])
-            if uf:
-                t_label = "Tier 1 (Invariant)" if uf["tier"] == 1 else "Tier 2 (Degenerate)"
-                uf_aln = f"Cols {uf['start_col'] + pcr_start} – {uf['end_col'] + pcr_start}"
-                full_c = uf.get('full_dataset_coverage_pct', uf['coverage_pct'])
-                lines.append(f"| `Uni-Seq-F1` | Forward Terminal | FORWARD | **{uf_aln}** | {uf['length']} nt | `{uf['order_sequence']}` | {uf['tm']} | {uf['gc_pct']}% | {uf['coverage_pct']}% | **{full_c}%** | {t_label} |")
-            if ur:
-                t_label = "Tier 1 (Invariant)" if ur["tier"] == 1 else "Tier 2 (Degenerate)"
-                ur_aln = f"Cols {ur['start_col'] + pcr_start} – {ur['end_col'] + pcr_start}"
-                full_c = ur.get('full_dataset_coverage_pct', ur['coverage_pct'])
-                lines.append(f"| `Uni-Seq-R1` | Reverse Terminal | REVERSE | **{ur_aln}** | {ur['length']} nt | `{ur['order_sequence']}` | {ur['tm']} | {ur['gc_pct']}% | {ur['coverage_pct']}% | **{full_c}%** | {t_label} |")
         else:
-            lines.extend([
-                "### Universal Primers Summary Table",
-                "| Primer ID | Role | Direction | Position (bp) | Length | Sequence (5' → 3') | Tm (°C) | GC% | Population Coverage | Tier |",
-                "|---|---|---|---|---|---|---|---|---|---|"
-            ])
-            if uf:
-                t_label = "Tier 1 (Invariant)" if uf["tier"] == 1 else "Tier 2 (Degenerate)"
-                uf_aln = f"Cols {uf['start_col'] + pcr_start} – {uf['end_col'] + pcr_start}"
-                full_c = uf.get('full_dataset_coverage_pct', uf['coverage_pct'])
-                cnt_fwd = uf.get('full_dataset_count', uf.get('count', ''))
-                cov_display = f"**{full_c}%**" + (f" ({cnt_fwd}/{total_full} seqs)" if cnt_fwd else "")
-                lines.append(f"| `Uni-Seq-F1` | Forward Terminal | FORWARD | **{uf_aln}** | {uf['length']} nt | `{uf['order_sequence']}` | {uf['tm']} | {uf['gc_pct']}% | {cov_display} | {t_label} |")
-            if ur:
-                t_label = "Tier 1 (Invariant)" if ur["tier"] == 1 else "Tier 2 (Degenerate)"
-                ur_aln = f"Cols {ur['start_col'] + pcr_start} – {ur['end_col'] + pcr_start}"
-                full_c = ur.get('full_dataset_coverage_pct', ur['coverage_pct'])
-                cnt_rev = ur.get('full_dataset_count', ur.get('count', ''))
-                cov_display = f"**{full_c}%**" + (f" ({cnt_rev}/{total_full} seqs)" if cnt_rev else "")
-                lines.append(f"| `Uni-Seq-R1` | Reverse Terminal | REVERSE | **{ur_aln}** | {ur['length']} nt | `{ur['order_sequence']}` | {ur['tm']} | {ur['gc_pct']}% | {cov_display} | {t_label} |")
-        lines.append("")
+            if is_subsampled:
+                lines.extend([
+                    "### Universal Primers Summary Table",
+                    "| Primer ID | Role | Direction | Position (bp) | Length | Sequence (5' → 3') | Tm (°C) | GC% | Subsample Cov | Full Cov | Tier |",
+                    "|---|---|---|---|---|---|---|---|---|---|---|"
+                ])
+                if uf:
+                    t_label = "Tier 1 (Invariant)" if uf["tier"] == 1 else "Tier 2 (Degenerate)"
+                    uf_aln = f"Cols {uf['start_col'] + pcr_start} – {uf['end_col'] + pcr_start}"
+                    full_c = uf.get('full_dataset_coverage_pct', uf['coverage_pct'])
+                    lines.append(f"| `Uni-Seq-F1` | Forward Terminal | FORWARD | **{uf_aln}** | {uf['length']} nt | `{uf['order_sequence']}` | {uf['tm']} | {uf['gc_pct']}% | {uf['coverage_pct']}% | **{full_c}%** | {t_label} |")
+                if ur:
+                    t_label = "Tier 1 (Invariant)" if ur["tier"] == 1 else "Tier 2 (Degenerate)"
+                    ur_aln = f"Cols {ur['start_col'] + pcr_start} – {ur['end_col'] + pcr_start}"
+                    full_c = ur.get('full_dataset_coverage_pct', ur['coverage_pct'])
+                    lines.append(f"| `Uni-Seq-R1` | Reverse Terminal | REVERSE | **{ur_aln}** | {ur['length']} nt | `{ur['order_sequence']}` | {ur['tm']} | {ur['gc_pct']}% | {ur['coverage_pct']}% | **{full_c}%** | {t_label} |")
+            else:
+                lines.extend([
+                    "### Universal Primers Summary Table",
+                    "| Primer ID | Role | Direction | Position (bp) | Length | Sequence (5' → 3') | Tm (°C) | GC% | Population Coverage | Tier |",
+                    "|---|---|---|---|---|---|---|---|---|---|"
+                ])
+                if uf:
+                    t_label = "Tier 1 (Invariant)" if uf["tier"] == 1 else "Tier 2 (Degenerate)"
+                    uf_aln = f"Cols {uf['start_col'] + pcr_start} – {uf['end_col'] + pcr_start}"
+                    full_c = uf.get('full_dataset_coverage_pct', uf['coverage_pct'])
+                    cnt_fwd = uf.get('full_dataset_count', uf.get('count', ''))
+                    cov_display = f"**{full_c}%**" + (f" ({cnt_fwd}/{total_full} seqs)" if cnt_fwd else "")
+                    lines.append(f"| `Uni-Seq-F1` | Forward Terminal | FORWARD | **{uf_aln}** | {uf['length']} nt | `{uf['order_sequence']}` | {uf['tm']} | {uf['gc_pct']}% | {cov_display} | {t_label} |")
+                if ur:
+                    t_label = "Tier 1 (Invariant)" if ur["tier"] == 1 else "Tier 2 (Degenerate)"
+                    ur_aln = f"Cols {ur['start_col'] + pcr_start} – {ur['end_col'] + pcr_start}"
+                    full_c = ur.get('full_dataset_coverage_pct', ur['coverage_pct'])
+                    cnt_rev = ur.get('full_dataset_count', ur.get('count', ''))
+                    cov_display = f"**{full_c}%**" + (f" ({cnt_rev}/{total_full} seqs)" if cnt_rev else "")
+                    lines.append(f"| `Uni-Seq-R1` | Reverse Terminal | REVERSE | **{ur_aln}** | {ur['length']} nt | `{ur['order_sequence']}` | {ur['tm']} | {ur['gc_pct']}% | {cov_display} | {t_label} |")
+            lines.append("")
+
+            if uf and not ur:
+                lines.extend([
+                    "> [!NOTE]",
+                    "> **Single-End Sequencing Primer Selected:** Only the Forward universal primer met the required coverage and biophysical thresholds. The reverse terminal region is too variable for a single universal oligo. Forward sequencing alone can sequence the amplicon, or use Mode 2 below for strain-specific reverse reactions.",
+                    ""
+                ])
+            elif ur and not uf:
+                lines.extend([
+                    "> [!NOTE]",
+                    "> **Single-End Sequencing Primer Selected:** Only the Reverse universal primer met the required coverage and biophysical thresholds. The forward terminal region is too variable for a single universal oligo. Reverse sequencing alone can sequence the amplicon, or use Mode 2 below for strain-specific forward reactions.",
+                    ""
+                ])
 
         if uf:
             tier_badge = "🟢 Tier 1 (Strict Invariant, 0 Degeneracy)" if uf["tier"] == 1 else "🟡 Tier 2 (Fallback: 2-Fold Degenerate)"
@@ -437,27 +482,22 @@ class SangerAmpliconPipeline:
             lines.extend([
                 "",
                 "### Lineage Breakdown in Full Dataset",
-                "| Lineage ID | Subsample Count | Subsample Share | Full Dataset Count | Full Dataset Share | Assigned Test Tube |",
+                "| Lineage ID | Subsample Count | Subsample Share | Est. Full Dataset Count | Est. Full Share | Assigned Test Tube |",
                 "|---|---|---|---|---|---|"
             ])
             for c in panel.get("all_clusters", []):
-                tube_assigned = "Filtered (<2% minor variant)"
-                f_count = c.get("full_count", "-")
-                f_pct = f"{c.get('full_freq', '-')}%" if "full_freq" in c else "-"
-                for p_entry in panel.get("panel", []):
-                    if p_entry["target_cluster"] == c["id"]:
-                        tube_assigned = f"**{p_entry['tube_id']}** (`{p_entry['primer_name']}`)"
-                        f_count = f"{p_entry.get('full_dataset_count', '-')} / {total_full} seqs"
-                        f_pct = f"**{p_entry.get('full_dataset_coverage_pct', '-')}%**"
-                        break
+                assigned_tube = c.get("assigned_tube", "Uncovered")
+                tube_label = f"**{assigned_tube}**" if assigned_tube != "Uncovered" else "Filtered / Uncovered"
+                f_count_est = f"~{c.get('full_count_est', round(c['freq'] * total_full / 100))} / {total_full} seqs"
+                f_pct_est = f"~{c['freq']}%"
                 lines.append(
-                    f"| **{c['id']}** | {c['count']} / {res['total_sequences']} seqs | {c['freq']}% | {f_count} | {f_pct} | {tube_assigned} |"
+                    f"| **{c['id']}** | {c['count']} / {res['total_sequences']} seqs | {c['freq']}% | {f_count_est} | {f_pct_est} | {tube_label} |"
                 )
 
             lines.extend([
                 "",
                 "### Minimal Panel Tubes",
-                "| Tube ID | Primer ID | Target Variant | Position (bp) | Direction | Sequence (5' → 3') | Length | Tm (°C) | Subsample Share | Full Dataset Share | Reaction Protocol |",
+                "| Tube ID | Primer ID | Target Variant(s) | Position (bp) | Direction | Sequence (5' → 3') | Length | Tm (°C) | Subsample Share | Full Dataset Share | Reaction Protocol |",
                 "|---|---|---|---|---|---|---|---|---|---|---|"
             ])
             for entry in panel.get("panel", []):
@@ -474,25 +514,18 @@ class SangerAmpliconPipeline:
                 "|---|---|---|---|"
             ])
             for c in panel.get("all_clusters", []):
-                tube_assigned = "Filtered (<2% minor variant)"
+                assigned_tube = c.get("assigned_tube", "Uncovered")
+                tube_label = f"**{assigned_tube}**" if assigned_tube != "Uncovered" else "Filtered / Uncovered"
                 f_count = f"{c['count']} / {total_full} seqs"
                 f_pct = f"**{c['freq']}%**"
-                for p_entry in panel.get("panel", []):
-                    if p_entry["target_cluster"] == c["id"]:
-                        tube_assigned = f"**{p_entry['tube_id']}** (`{p_entry['primer_name']}`)"
-                        actual_cnt = p_entry.get('full_dataset_count', p_entry.get('subsample_count', c['count']))
-                        actual_pct = p_entry.get('full_dataset_coverage_pct', p_entry.get('subsample_freq', c['freq']))
-                        f_count = f"{actual_cnt} / {total_full} seqs"
-                        f_pct = f"**{actual_pct}%**"
-                        break
                 lines.append(
-                    f"| **{c['id']}** | {f_count} | {f_pct} | {tube_assigned} |"
+                    f"| **{c['id']}** | {f_count} | {f_pct} | {tube_label} |"
                 )
 
             lines.extend([
                 "",
                 "### Minimal Panel Tubes",
-                "| Tube ID | Primer ID | Target Variant | Position (bp) | Direction | Sequence (5' → 3') | Length | Tm (°C) | Population Share | Reaction Protocol |",
+                "| Tube ID | Primer ID | Target Variant(s) | Position (bp) | Direction | Sequence (5' → 3') | Length | Tm (°C) | Population Share | Reaction Protocol |",
                 "|---|---|---|---|---|---|---|---|---|---|"
             ])
             for entry in panel.get("panel", []):
@@ -515,13 +548,22 @@ class SangerAmpliconPipeline:
             "Primer_Name\tSequence_5_to_3\tPosition\tLength\tTm_C\tNotes"
         ])
 
+        seen_order_seqs = set()
+
         if uf:
-            lines.append(f"Uni-Seq-F1\t{uf['order_sequence']}\tCols {uf['start_col'] + pcr_start}-{uf['end_col'] + pcr_start}\t{uf['length']}\t{uf['tm']}\tUniversal Sanger Fwd ({uf['coverage_pct']}% cov)")
+            seen_order_seqs.add(uf['order_sequence'])
+            f_cov = uf.get('full_dataset_coverage_pct', uf['coverage_pct'])
+            lines.append(f"Uni-Seq-F1\t{uf['order_sequence']}\tCols {uf['start_col'] + pcr_start}-{uf['end_col'] + pcr_start}\t{uf['length']}\t{uf['tm']}\tUniversal Sanger Fwd ({f_cov}% cov)")
         if ur:
-            lines.append(f"Uni-Seq-R1\t{ur['order_sequence']}\tCols {ur['start_col'] + pcr_start}-{ur['end_col'] + pcr_start}\t{ur['length']}\t{ur['tm']}\tUniversal Sanger Rev ({ur['coverage_pct']}% cov)")
+            seen_order_seqs.add(ur['order_sequence'])
+            r_cov = ur.get('full_dataset_coverage_pct', ur['coverage_pct'])
+            lines.append(f"Uni-Seq-R1\t{ur['order_sequence']}\tCols {ur['start_col'] + pcr_start}-{ur['end_col'] + pcr_start}\t{ur['length']}\t{ur['tm']}\tUniversal Sanger Rev ({r_cov}% cov)")
         
         for entry in panel.get("panel", []):
-            lines.append(f"{entry['primer_name']}\t{entry['sequence']}\tCols {entry.get('start_col', 0) + pcr_start}-{entry.get('end_col', 0) + pcr_start}\t{len(entry['sequence'])}\t{entry['tm']}\tStrain-Specific ({entry['target_cluster']}, {entry.get('full_dataset_coverage_pct', entry['frequency_covered_pct'])}%)")
+            p_seq = entry["sequence"]
+            if p_seq not in seen_order_seqs:
+                seen_order_seqs.add(p_seq)
+                lines.append(f"{entry['primer_name']}\t{p_seq}\tCols {entry.get('start_col', 0) + pcr_start}-{entry.get('end_col', 0) + pcr_start}\t{len(p_seq)}\t{entry['tm']}\tStrain-Specific ({entry['target_cluster']}, {entry.get('full_dataset_coverage_pct', entry['frequency_covered_pct'])}%)")
 
         lines.extend([
             "```",

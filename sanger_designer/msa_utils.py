@@ -39,20 +39,27 @@ IUPAC_TWO_FOLD = {
 RC_TABLE = str.maketrans("ACGTURYKMSWBDHVNacgturykmswbdhvn", "TGCAAYRMKSWVHDBNtgcaayrmkswvhdbn")
 
 
+# Precompute instant IUPAC match set across all character pairs
+IUPAC_MATCH_SET = set()
+for _pb, _p_bases in IUPAC_TABLE.items():
+    for _tb, _t_bases in IUPAC_TABLE.items():
+        if _p_bases.intersection(_t_bases):
+            IUPAC_MATCH_SET.add((_pb, _tb))
+            IUPAC_MATCH_SET.add((_pb.lower(), _tb))
+            IUPAC_MATCH_SET.add((_pb, _tb.lower()))
+            IUPAC_MATCH_SET.add((_pb.lower(), _tb.lower()))
+
+
 def reverse_complement(seq_str: str) -> str:
     """Return reverse complement supporting standard IUPAC ambiguity codes."""
     return seq_str.translate(RC_TABLE)[::-1]
 
 
 def iupac_matches(primer_base: str, template_base: str) -> bool:
-    """Check if a primer IUPAC character matches a template base."""
-    pb = primer_base.upper()
-    tb = template_base.upper()
-    if pb == tb:
+    """Instant O(1) IUPAC character match check with zero allocations."""
+    if primer_base == template_base:
         return True
-    allowed_primer_bases = IUPAC_TABLE.get(pb, {pb})
-    allowed_template_bases = IUPAC_TABLE.get(tb, {tb})
-    return bool(allowed_primer_bases.intersection(allowed_template_bases))
+    return (primer_base, template_base) in IUPAC_MATCH_SET
 
 
 def load_alignment(fasta_path: str) -> Tuple[List[str], List[str]]:
@@ -93,10 +100,17 @@ def load_alignment(fasta_path: str) -> Tuple[List[str], List[str]]:
         mafft_bin = shutil.which("mafft") or "/opt/homebrew/bin/mafft"
         if os.path.exists(mafft_bin) if os.path.isabs(mafft_bin) else mafft_bin:
             # Subsample up to 1000 sequences if very large
-            to_align_records = [r for r in SeqIO.parse(fasta_path, "fasta") if len(r.seq) >= 1500]
-            if len(to_align_records) > 1000:
+            all_records = list(SeqIO.parse(fasta_path, "fasta"))
+            if len(all_records) > 1000:
                 random.seed(42)
-                to_align_records = random.sample(to_align_records, 1000)
+                lengths = sorted(len(r.seq) for r in all_records)
+                median_len = lengths[len(lengths) // 2]
+                min_len = max(200, int(median_len * 0.7))
+                valid_records = [r for r in all_records if len(r.seq) >= min_len]
+                if len(valid_records) > 1000:
+                    to_align_records = random.sample(valid_records, 1000)
+                else:
+                    to_align_records = valid_records if valid_records else all_records[:1000]
                 sub_fasta = os.path.join(dir_name, f"{base_name}_sub1000.fasta")
                 SeqIO.write(to_align_records, sub_fasta, "fasta")
                 input_for_mafft = sub_fasta
@@ -112,6 +126,12 @@ def load_alignment(fasta_path: str) -> Tuple[List[str], List[str]]:
                 f"File {fasta_path} contains sequences of varying lengths and MAFFT was not found. "
                 "Please provide a pre-aligned FASTA file (e.g. from MAFFT or MUSCLE)."
             )
+
+    if is_aligned and len(sequences) > 1000:
+        random.seed(42)
+        sample_indices = sorted(random.sample(range(len(sequences)), 1000))
+        headers = [headers[i] for i in sample_indices]
+        sequences = [sequences[i] for i in sample_indices]
 
     return headers, sequences
 

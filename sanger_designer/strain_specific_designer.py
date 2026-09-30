@@ -66,14 +66,26 @@ class StrainSpecificSangerDesigner:
         
         for c_id, (sub_seq, members) in enumerate(sorted_haps, 1):
             freq = round((len(members) / total_seqs) * 100.0, 2)
-            if freq < min_cluster_freq_pct and len(clusters) >= 2:
-                continue
+
+            # Strictly cap at top 8 lineages if there are more than 8
             if len(clusters) >= max_clusters:
                 break
 
+            # Always guarantee top 2 lineages
+            if len(clusters) >= 2:
+                # If we have 2 to 4 clusters, only accept lineages with substantial frequency (>= 4.5%)
+                # to prevent showing 5 or 6 minor ~2% variants (2 or 4 major lineages preferred)
+                if len(clusters) < 4:
+                    if freq < 4.5:
+                        break
+                else:
+                    # Beyond 4 lineages (up to 8), only accept true major clades (>= 5.0%)
+                    if freq < 5.0:
+                        break
+
             rep_full_seq = members[0][2]
             clusters.append({
-                "cluster_id": f"Lineage_{c_id}",
+                "cluster_id": f"Lineage_{len(clusters) + 1}",
                 "rep_sequence": rep_full_seq,
                 "count": len(members),
                 "frequency_pct": freq,
@@ -165,7 +177,13 @@ class StrainSpecificSangerDesigner:
                         if not is_3prime_mismatch and total_mismatches < 2:
                             off_target_matches += 1
 
-                    # Primer is discriminatory if it has 3' mismatch against at least one or most off-target groups
+                    # Compute true covered indices across all sequences in amplicon_msa
+                    match_target = cand_seq if direction.upper() == "FORWARD" else reverse_complement(cand_seq)
+                    covered_seq_indices = {
+                        idx for idx, s in enumerate(amplicon_msa)
+                        if s[start_idx:end_idx] == match_target
+                    }
+
                     cluster_candidates[c_id].append({
                         "cluster_id": c_id,
                         "sequence": cand_seq,
@@ -178,63 +196,81 @@ class StrainSpecificSangerDesigner:
                         "gc_pct": bio["gc_pct"],
                         "hairpin_dg": bio["hairpin_dg"],
                         "homodimer_dg": bio["homodimer_dg"],
-                        "target_coverage_pct": cluster["frequency_pct"],
-                        "covered_indices": set(cluster["member_indices"]),
+                        "target_coverage_pct": round(len(covered_seq_indices) / total_seqs * 100.0, 2),
+                        "covered_indices": covered_seq_indices,
                         "off_target_details": off_target_details,
                         "clean_discrimination": (off_target_matches == 0)
                     })
 
-        # Solve Greedy Set Cover to select minimal panel
+        # Solve Greedy Set Cover to select minimal panel without duplicate primers
         uncovered = set(range(total_seqs))
         selected_panel = []
+        selected_sequences = set()
         tube_num = 1
 
-        while uncovered and cluster_candidates:
+        # Flatten all candidates across all clusters so we pick globally optimal oligos
+        all_candidates = []
+        for cands in cluster_candidates.values():
+            all_candidates.extend(cands)
+
+        while uncovered and all_candidates:
             best_cand = None
             best_gain = 0
 
-            for c_id, cands in cluster_candidates.items():
-                for c in cands:
-                    gain = len(c["covered_indices"].intersection(uncovered))
-                    if gain > best_gain:
-                        best_gain = gain
+            for c in all_candidates:
+                if c["sequence"] in selected_sequences:
+                    continue
+                gain = len(c["covered_indices"].intersection(uncovered))
+                if gain > best_gain:
+                    best_gain = gain
+                    best_cand = c
+                elif gain == best_gain and best_cand:
+                    # Prefer cleaner discrimination and better Tm
+                    if c["clean_discrimination"] and not best_cand["clean_discrimination"]:
                         best_cand = c
-                    elif gain == best_gain and best_cand:
-                        # Prefer cleaner discrimination and better Tm
-                        if c["clean_discrimination"] and not best_cand["clean_discrimination"]:
-                            best_cand = c
 
             if not best_cand or best_gain == 0:
                 break
 
             uncovered.difference_update(best_cand["covered_indices"])
-            
+            selected_sequences.add(best_cand["sequence"])
+
+            # Determine all clusters covered by this primer
+            clusters_covered = [
+                cl["cluster_id"] for cl in clusters
+                if any(m_idx in best_cand["covered_indices"] for m_idx in cl["member_indices"])
+            ]
+            if len(clusters_covered) == 1:
+                target_str = clusters_covered[0]
+            elif len(clusters_covered) > 1:
+                target_str = f"{clusters_covered[0]} – {clusters_covered[-1]} ({len(clusters_covered)} lineages)"
+            else:
+                target_str = best_cand["cluster_id"]
+
             panel_entry = {
                 "tube_id": f"Tube_{tube_num}",
-                "primer_name": f"Spec_{best_cand['direction'][0]}_{best_cand['cluster_id']}",
-                "target_cluster": best_cand["cluster_id"],
+                "primer_name": f"Spec_{best_cand['direction'][0]}_Tube_{tube_num}",
+                "target_cluster": target_str,
+                "covered_cluster_ids": clusters_covered,
                 "sequence": best_cand["sequence"],
                 "direction": best_cand["direction"],
                 "start_col": best_cand["start_col"],
                 "end_col": best_cand["end_col"],
                 "tm": best_cand["tm"],
                 "gc_pct": best_cand["gc_pct"],
-                "frequency_covered_pct": best_cand["target_coverage_pct"],
+                "frequency_covered_pct": round(len(best_cand["covered_indices"]) / total_seqs * 100.0, 2),
+                "covered_indices": list(best_cand["covered_indices"]),
                 "action_protocol": (
-                    f"Test in Tube {tube_num}. Selective 3' extension ensures clean trace "
-                    f"for {best_cand['cluster_id']} even in mixtures."
+                    f"Test in Tube {tube_num}. Primer covers {target_str} cleanly."
                 )
             }
             selected_panel.append(panel_entry)
             tube_num += 1
 
-            # Remove used cluster
-            if best_cand["cluster_id"] in cluster_candidates:
-                del cluster_candidates[best_cand["cluster_id"]]
-
-        total_panel_coverage = round(
-            sum(p["frequency_covered_pct"] for p in selected_panel), 2
-        )
+        all_covered = set()
+        for p in selected_panel:
+            all_covered.update(p["covered_indices"])
+        total_panel_coverage = round(len(all_covered) / total_seqs * 100.0, 2) if total_seqs else 0.0
 
         return {
             "status": "SUCCESS" if selected_panel else "FAILED",
@@ -243,7 +279,15 @@ class StrainSpecificSangerDesigner:
             "total_coverage_pct": total_panel_coverage,
             "panel": selected_panel,
             "all_clusters": [
-                {"id": c["cluster_id"], "freq": c["frequency_pct"], "count": c["count"]}
+                {
+                    "id": c["cluster_id"],
+                    "freq": c["frequency_pct"],
+                    "count": c["count"],
+                    "assigned_tube": next(
+                        (p["tube_id"] for p in selected_panel if c["cluster_id"] in p.get("covered_cluster_ids", [])),
+                        "Uncovered"
+                    )
+                }
                 for c in clusters
             ]
         }
