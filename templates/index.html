@@ -177,10 +177,40 @@
                         </div>
                     </div>
 
+                    <!-- FASTA Input Selection: File Upload or Path -->
                     <div class="mb-3">
-                        <label class="form-label small text-secondary">Aligned FASTA File Path *</label>
-                        <input type="text" class="form-control" id="fastaPath" placeholder="/Users/.../aligned.fasta" required>
-                        <div class="form-text text-secondary" style="font-size: 0.75rem;">Must be pre-aligned (e.g. MAFFT/MUSCLE).</div>
+                        <label class="form-label small text-secondary fw-semibold">FASTA Input *</label>
+                        <ul class="nav nav-pills nav-fill mb-2" id="inputMethodTabs" style="font-size: 0.83rem;">
+                            <li class="nav-item">
+                                <a class="nav-link active py-1" id="tabUpload" href="javascript:void(0)" onclick="switchInputMethod('upload')">
+                                    <i class="fa-solid fa-cloud-arrow-up me-1"></i>Upload File (All OS)
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a class="nav-link py-1" id="tabPath" href="javascript:void(0)" onclick="switchInputMethod('path')">
+                                    <i class="fa-solid fa-folder-open me-1"></i>Enter File Path
+                                </a>
+                            </li>
+                        </ul>
+
+                        <!-- Direct File Upload Box -->
+                        <div id="uploadInputBox" class="border rounded p-3 text-center mb-2" style="background-color: #0b0f17; border-color: #334155; border-style: dashed !important; cursor: pointer;" onclick="document.getElementById('fileUploadInput').click()">
+                            <input type="file" id="fileUploadInput" class="d-none" accept=".fasta,.fa,.fna,.txt" onchange="handleFileUpload(this)">
+                            <i class="fa-solid fa-file-arrow-up text-info fs-3 mb-2"></i>
+                            <div class="small fw-semibold" id="uploadStatusText">Click to browse or drag &amp; drop FASTA file</div>
+                            <div class="text-secondary" style="font-size: 0.75rem;">Works from any computer (Windows, Mac, Linux)</div>
+                            <div id="uploadProgress" class="progress mt-2 d-none" style="height: 6px;">
+                                <div class="progress-bar progress-bar-striped progress-bar-animated bg-info" style="width: 100%"></div>
+                            </div>
+                        </div>
+
+                        <!-- Manual Path Box -->
+                        <div id="pathInputBox" class="d-none">
+                            <input type="text" class="form-control font-monospace" id="fastaPath" placeholder="C:\Users\...\file.fasta or /Users/.../file.fasta" oninput="cleanPastedPath(this)">
+                            <div class="form-text text-secondary" style="font-size: 0.75rem;">
+                                Windows (<code>C:\...</code>) &amp; Mac (<code>/Users/...</code>) paths with or without quotes are automatically parsed.
+                            </div>
+                        </div>
                     </div>
 
                     <!-- PCR Workflow Selection -->
@@ -283,18 +313,120 @@ function togglePcrMode() {
     }
 }
 
+function switchInputMethod(method) {
+    const tabUpload = document.getElementById('tabUpload');
+    const tabPath = document.getElementById('tabPath');
+    const uploadBox = document.getElementById('uploadInputBox');
+    const pathBox = document.getElementById('pathInputBox');
+    
+    if (method === 'upload') {
+        tabUpload.classList.add('active');
+        tabPath.classList.remove('active');
+        uploadBox.classList.remove('d-none');
+        pathBox.classList.add('d-none');
+    } else {
+        tabPath.classList.add('active');
+        tabUpload.classList.remove('active');
+        pathBox.classList.remove('d-none');
+        uploadBox.classList.add('d-none');
+    }
+}
+
+function cleanPastedPath(input) {
+    if (!input.value) return;
+    let p = input.value.trim();
+    // Strip surrounding quotes ("path" or 'path')
+    if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+        p = p.substring(1, p.length - 1).trim();
+    }
+    // Handle file:/// URI scheme
+    if (p.startsWith('file:///')) {
+        p = p.substring(8);
+        if (!(p.length > 2 && p[1] === ':')) {
+            p = '/' + p;
+        }
+    }
+    input.value = p;
+}
+
+async function handleFileUpload(input) {
+    if (!input.files || input.files.length === 0) return;
+    const file = input.files[0];
+    const statusText = document.getElementById('uploadStatusText');
+    const prog = document.getElementById('uploadProgress');
+    
+    statusText.innerHTML = `<span class="spinner-border spinner-border-sm me-2"></span>Uploading ${file.name}...`;
+    prog.classList.remove('d-none');
+    
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    try {
+        const resp = await fetch('/api/upload', {
+            method: 'POST',
+            body: formData
+        });
+        const d = await resp.json();
+        if (d.status === 'SUCCESS') {
+            document.getElementById('fastaPath').value = d.filepath;
+            const sizeMb = (file.size / (1024 * 1024)).toFixed(2);
+            statusText.innerHTML = `<i class="fa-solid fa-circle-check text-success me-1"></i><strong class="text-success">${file.name}</strong> ready (${sizeMb} MB)`;
+        } else {
+            statusText.innerHTML = `<span class="text-danger"><i class="fa-solid fa-circle-exclamation me-1"></i>Upload failed: ${d.message}</span>`;
+        }
+    } catch (e) {
+        statusText.innerHTML = `<span class="text-danger"><i class="fa-solid fa-circle-exclamation me-1"></i>Network error: ${e.message}</span>`;
+    } finally {
+        prog.classList.add('d-none');
+    }
+}
+
+// Drag & drop support for FASTA upload box
+const dropBox = document.getElementById('uploadInputBox');
+if (dropBox) {
+    ['dragenter', 'dragover'].forEach(name => {
+        dropBox.addEventListener(name, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropBox.style.borderColor = '#38bdf8';
+            dropBox.style.backgroundColor = '#1e293b';
+        });
+    });
+    ['dragleave', 'drop'].forEach(name => {
+        dropBox.addEventListener(name, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropBox.style.borderColor = '#334155';
+            dropBox.style.backgroundColor = '#0b0f17';
+        });
+    });
+    dropBox.addEventListener('drop', (e) => {
+        if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            const fileInput = document.getElementById('fileUploadInput');
+            fileInput.files = e.dataTransfer.files;
+            handleFileUpload(fileInput);
+        }
+    });
+}
+
 document.getElementById('pipelineForm').addEventListener('submit', async function(e) {
     e.preventDefault();
     const btn = document.getElementById('runBtn');
     const statusBadge = document.getElementById('statusBadge');
     const viewer = document.getElementById('reportViewer');
 
+    const fastaPath = document.getElementById('fastaPath').value.trim();
+    if (!fastaPath) {
+        alert('Please either upload a FASTA file or enter a valid file path.');
+        return;
+    }
+
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Designing Primers...';
     statusBadge.innerHTML = '<span class="badge bg-primary"><i class="fa-solid fa-spinner fa-spin me-1"></i>Running</span>';
 
     const payload = {
-        fasta_path: document.getElementById('fastaPath').value.trim(),
+        fasta_path: fastaPath,
         fwd_pcr: document.getElementById('pcrMode').value === 'pathA' ? document.getElementById('fwdPcr').value.trim() : null,
         rev_pcr: document.getElementById('pcrMode').value === 'pathA' ? document.getElementById('revPcr').value.trim() : null,
         target_start: document.getElementById('targetStart').value ? parseInt(document.getElementById('targetStart').value) : null,
@@ -318,7 +450,7 @@ document.getElementById('pipelineForm').addEventListener('submit', async functio
             viewer.innerHTML = marked.parse(data.report);
         } else {
             statusBadge.innerHTML = '<span class="badge bg-danger">Error</span>';
-            viewer.innerHTML = `<div class="alert alert-danger"><i class="fa-solid fa-circle-exclamation me-2"></i>${data.message}</div>`;
+            viewer.innerHTML = `<div class="alert alert-danger"><i class="fa-solid fa-circle-exclamation me-2"></i>${data.message.replace(/\\n/g, '<br>')}</div>`;
         }
     } catch (err) {
         statusBadge.innerHTML = '<span class="badge bg-danger">Network Error</span>';
